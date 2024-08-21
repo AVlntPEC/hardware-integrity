@@ -1,66 +1,157 @@
-#include <Wire.h>
-#include <Adafruit_MCP4725.h>
+int motorControlPin = 9; // Output PWM to control vehicle speed
+int throttleSignalPin = 2; // Input from throttle signal wire
+int pwmArray[] = {1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000};
+int speedArray[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20};
 
-// Create an instance of the MCP4725 DAC
-Adafruit_MCP4725 dac;
+unsigned long debounceDelay = 50;
+unsigned long lastThrottleSignalTime = 0;
+int lastSpeed = 0; // Store the last speed for fail-safe recovery
 
-// Define the voltage levels for different speeds
-const float voltages[] = {3.2, 3.6, 4.0, 4.4, 4.6};  // Adjust these based on your needs
-const float speeds[] = {0, 7, 14, 18, 20};           // Corresponding speeds in km/h
-
-const int REFERENCE_VOLTAGE = 5000;  // Reference voltage in millivolts
-const int MIN_DAC_VALUE = 0;         // Minimum DAC value
-const int MAX_DAC_VALUE = 4095;      // Maximum DAC value
+// PID Controller Variables
+float kp = 1.0, ki = 0.1, kd = 0.05;
+float integral = 0, previousError = 0;
+float integralMax = 100.0; // Max value to prevent integral windup
 
 void setup() {
   Serial.begin(9600);
-  dac.begin(0x60);  // Initialize DAC with default I2C address (0x60)
+  pinMode(motorControlPin, OUTPUT);
+  pinMode(throttleSignalPin, INPUT);
 
-  // Initialize throttle at a safe start voltage
-  setThrottleVoltage(voltages[0]);
+  Serial.println("Enter target speed in km/h (0 to 20) or type 'stop' to halt:");
 }
 
 void loop() {
-  // Example: Simulate speed changes
-  for (int i = 0; i < sizeof(voltages) / sizeof(voltages[0]); i++) {
-    setThrottleVoltage(voltages[i]);
-    delay(2000);  // Wait for 2 seconds before moving to the next speed
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n').trim(); // Combined input read and trim
+
+    if (input.equalsIgnoreCase("stop")) {
+      stopVehicle();
+    } else {
+      int targetSpeed = input.toInt();
+
+      if (targetSpeed >= 0 && targetSpeed <= 20) {
+        int currentSpeed = lastSpeed;
+
+        // Gradually increase speed to the target speed
+        while (currentSpeed < targetSpeed) {
+          if (driverOverride()) return;
+
+          currentSpeed = adaptiveCruiseControl(currentSpeed, targetSpeed);
+          delayWithSafetyCheck(2000);
+        }
+
+        // Gradually decrease speed back to 0
+        while (currentSpeed > 0) {
+          if (driverOverride()) return;
+
+          currentSpeed--;
+          int pwmValue = getPWMValue(currentSpeed);
+          analogWrite(motorControlPin, pwmValue);
+
+          Serial.print("Decreasing Speed: ");
+          Serial.print(currentSpeed);
+          Serial.print(" km/h, PWM Value: ");
+          Serial.println(pwmValue);
+
+          delayWithSafetyCheck(2000);
+        }
+
+        analogWrite(motorControlPin, pwmArray[0]);
+        Serial.println("Vehicle has stopped at 0 km/h.");
+        lastSpeed = 0; // Reset lastSpeed after stopping
+      } else {
+        Serial.println("Invalid speed. Enter a value between 0 and 20 km/h.");
+      }
+    }
+  }
+}
+
+// Function to get the PWM value corresponding to the current speed
+int getPWMValue(int speed) {
+  for (int i = 0; i < sizeof(speedArray) / sizeof(speedArray[0]); i++) {
+    if (speed == speedArray[i]) {
+      return pwmArray[i];
+    }
+  }
+  return 1000;
+}
+
+// Adaptive Cruise Control using PID
+int adaptiveCruiseControl(int currentSpeed, int targetSpeed) {
+  float error = targetSpeed - currentSpeed;
+  integral += error;
+
+  // Prevent integral windup
+  if (integral > integralMax) integral = integralMax;
+  if (integral < -integralMax) integral = -integralMax;
+
+  float derivative = error - previousError;
+
+  int adjustment = kp * error + ki * integral + kd * derivative;
+
+  previousError = error;
+
+  currentSpeed += adjustment;
+
+  // Limit speed to target
+  if (currentSpeed > targetSpeed) currentSpeed = targetSpeed;
+  if (currentSpeed < 0) currentSpeed = 0;
+
+  int pwmValue = getPWMValue(currentSpeed);
+  analogWrite(motorControlPin, pwmValue);
+
+  Serial.print("Adaptive Speed: ");
+  Serial.print(currentSpeed);
+  Serial.print(" km/h, PWM Value: ");
+  Serial.println(pwmValue);
+
+  return currentSpeed;
+}
+
+// Function to check if the driver has pressed the accelerator (override) with debounce
+bool driverOverride() {
+  int throttleSignal = pulseIn(throttleSignalPin, HIGH);
+
+  if (throttleSignal > 0 && (millis() - lastThrottleSignalTime > debounceDelay)) {
+    lastThrottleSignalTime = millis();
+
+    Serial.println("Driver override detected. Control bypassed to driver.");
+    analogWrite(motorControlPin, throttleSignal); // Directly control the vehicle based on throttle input
+    return true;
   }
 
-  delay(5000);  // Pause before restarting the cycle
+  return false;
 }
 
-// Function to set the throttle voltage safely
-void setThrottleVoltage(float voltage) {
-  // Convert voltage to DAC value
-  uint16_t dacValue = calculateDACValue(voltage);
+// Function to introduce a delay with safety checks
+void delayWithSafetyCheck(unsigned long delayTime) {
+  unsigned long startTime = millis();
+  while (millis() - startTime < delayTime) {
+    if (driverOverride()) return;
+    delay(50); // Short delay for safety checks
+  }
+}
 
-  // Check if DAC value is within range
-  if (dacValue < MIN_DAC_VALUE || dacValue > MAX_DAC_VALUE) {
-    Serial.println("ERROR: DAC value out of range. Halting.");
-    emergencyShutdown();  // Call safety shutdown if out of range
-    return;
+// Function to gradually stop the vehicle
+void stopVehicle() {
+  int currentSpeed = lastSpeed;
+
+  while (currentSpeed > 0) {
+    if (driverOverride()) return;
+
+    currentSpeed--;
+    int pwmValue = getPWMValue(currentSpeed);
+    analogWrite(motorControlPin, pwmValue);
+
+    Serial.print("Stopping Vehicle: ");
+    Serial.print(currentSpeed);
+    Serial.print(" km/h, PWM Value: ");
+    Serial.println(pwmValue);
+
+    delayWithSafetyCheck(2000);
   }
 
-  // Send DAC value
-  dac.setVoltage(dacValue, false);
-
-  // Debug output
-  Serial.print("Setting throttle to ");
-  Serial.print(voltage);
-  Serial.print("V (DAC Value: ");
-  Serial.print(dacValue);
-  Serial.println(")");
-}
-
-// Function to calculate the DAC value based on desired voltage
-uint16_t calculateDACValue(float voltage) {
-  return (uint16_t)((voltage * MAX_DAC_VALUE) / (REFERENCE_VOLTAGE / 1000.0));
-}
-
-// Optional safety shutdown function
-void emergencyShutdown() {
-  setThrottleVoltage(voltages[0]);  // Reset throttle to minimum voltage
-  Serial.println("EMERGENCY SHUTDOWN ACTIVATED!");
-  while (true);  // Halt execution indefinitely
+  analogWrite(motorControlPin, pwmArray[0]);
+  Serial.println("Vehicle has stopped at 0 km/h.");
+  lastSpeed = 0; // Reset lastSpeed after stopping
 }
