@@ -22,7 +22,8 @@ void setup() {
 
 void loop() {
   if (Serial.available() > 0) {
-    String input = Serial.readStringUntil('\n').trim(); // Combined input read and trim
+    String input = Serial.readStringUntil('\n');
+    input.trim(); // Remove any leading/trailing whitespace
 
     if (input.equalsIgnoreCase("stop")) {
       stopVehicle();
@@ -73,7 +74,7 @@ int getPWMValue(int speed) {
       return pwmArray[i];
     }
   }
-  return 1000;
+  return pwmArray[0]; // Default to the minimum PWM if speed not found
 }
 
 // Adaptive Cruise Control using PID
